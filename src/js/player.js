@@ -1,7 +1,7 @@
 /**
  * @file player.js
  */
- // Subclasses Component
+// Subclasses Component
 import Component from './component.js';
 
 import {version} from '../../package.json';
@@ -14,12 +14,13 @@ import * as Dom from './utils/dom.js';
 import * as Fn from './utils/fn.js';
 import * as Guid from './utils/guid.js';
 import * as browser from './utils/browser.js';
+import {IE_VERSION} from './utils/browser.js';
 import log from './utils/log.js';
 import toTitleCase, { titleCaseEquals } from './utils/to-title-case.js';
 import { createTimeRange } from './utils/time-ranges.js';
 import { bufferedPercent } from './utils/buffer.js';
 import * as stylesheet from './utils/stylesheet.js';
-import FullscreenApi from './fullscreen-api.js';
+import FullscreenApi, {prefixedAPI as prefixedFS} from './fullscreen-api.js';
 import MediaError from './media-error.js';
 import safeParseTuple from 'safe-json-parse/tuple';
 import {assign} from './utils/obj';
@@ -32,7 +33,6 @@ import * as middleware from './tech/middleware.js';
 import {ALL as TRACK_TYPES} from './tracks/track-types';
 import filterSource from './utils/filter-source';
 import {findMimetype} from './utils/mimetypes';
-import {IE_VERSION} from './utils/browser';
 
 // The following imports are used only to ensure that the corresponding modules
 // are always included in the video.js package. Importing the modules will
@@ -332,11 +332,11 @@ class Player extends Component {
     // if the global option object was accidentally blown away by
     // someone, bail early with an informative error
     if (!this.options_ ||
-        !this.options_.techOrder ||
-        !this.options_.techOrder.length) {
+      !this.options_.techOrder ||
+      !this.options_.techOrder.length) {
       throw new Error('No techOrder specified. Did you overwrite ' +
-                      'videojs.options instead of just changing the ' +
-                      'properties you want to override?');
+        'videojs.options instead of just changing the ' +
+        'properties you want to override?');
     }
 
     // Store the original tag used to set options
@@ -481,7 +481,15 @@ class Player extends Component {
     this.reportUserActivity();
 
     this.one('play', this.listenForUserActivity_);
-    this.on('fullscreenchange', this.handleFullscreenChange_);
+
+    if (FullscreenApi.fullscreenchange) {
+      this.on(FullscreenApi.fullscreenchange, this.handleFullscreenChange_);
+
+      if (IE_VERSION || browser.IS_FIREFOX && prefixedFS) {
+        this.on(document, FullscreenApi.fullscreenchange, this.handleFullscreenChange_);
+      }
+    }
+
     this.on('stageclick', this.handleStageClick_);
 
     this.changingSrc_ = false;
@@ -507,6 +515,11 @@ class Player extends Component {
     this.trigger('dispose');
     // prevent dispose from being called twice
     this.off('dispose');
+
+    // make sure to remove fs handler on IE from the document
+    if (IE_VERSION || browser.IS_FIREFOX && prefixedFS) {
+      this.off(document, FullscreenApi.fullscreenchange, this.handleFullscreenChange_);
+    }
 
     if (this.styleEl_ && this.styleEl_.parentNode) {
       this.styleEl_.parentNode.removeChild(this.styleEl_);
@@ -1359,8 +1372,8 @@ class Player extends Component {
     // the current source cache is not up to date
     if (matchingSourceEls.length && !matchingSources.length) {
       this.cache_.sources = sourceElSources;
-    // if we don't have matching source or source els set the
-    // sources cache to the `currentSource` cache
+      // if we don't have matching source or source els set the
+      // sources cache to the `currentSource` cache
     } else if (!matchingSources.length) {
       this.cache_.sources = [this.cache_.source];
     }
@@ -1789,20 +1802,6 @@ class Player extends Component {
   }
 
   /**
-   * Fired when the player switches in or out of fullscreen mode
-   *
-   * @private
-   * @listens Player#fullscreenchange
-   */
-  handleFullscreenChange_() {
-    if (this.isFullscreen()) {
-      this.addClass('vjs-fullscreen');
-    } else {
-      this.removeClass('vjs-fullscreen');
-    }
-  }
-
-  /**
    * native click events on the SWF aren't triggered on IE11, Win8.1RT
    * use stageclick events triggered from inside the SWF instead
    *
@@ -1811,6 +1810,48 @@ class Player extends Component {
    */
   handleStageClick_() {
     this.reportUserActivity();
+  }
+
+  /**
+   * Fired when the player switches in or out of fullscreen mode
+   *
+   * @private
+   * @listens Player#fullscreenchange
+   * @listens Player#webkitfullscreenchange
+   * @listens Player#mozfullscreenchange
+   * @listens Player#MSFullscreenChange
+   * @fires Player#fullscreenchange
+   */
+  handleFullscreenChange_(event = {}, retriggerEvent = true) {
+    if (this.isFullscreen()) {
+      this.addClass('vjs-fullscreen');
+    } else {
+      this.removeClass('vjs-fullscreen');
+    }
+
+    if (prefixedFS && retriggerEvent) {
+      /**
+       * @event Player#fullscreenchange
+       * @type {EventTarget~Event}
+       */
+      this.trigger('fullscreenchange');
+    }
+  }
+
+  documentFullscreenChange_(e) {
+    const fsApi = FullscreenApi;
+
+    this.isFullscreen(document[fsApi.fullscreenElement]);
+
+    // If cancelling fullscreen, remove event listener.
+    if (this.isFullscreen() === false) {
+      Events.off(document, fsApi.fullscreenchange, Fn.bind(this, this.documentFullscreenChange_));
+      if (prefixedFS) {
+        this.handleFullscreenChange_({}, false);
+      } else {
+        this.on(FullscreenApi.fullscreenchange, this.handleFullscreenChange_);
+      }
+    }
   }
 
   /**
@@ -2020,17 +2061,17 @@ class Player extends Component {
         callback(this.play());
       });
 
-    // If the player/tech is ready and we have a source, we can attempt playback.
+      // If the player/tech is ready and we have a source, we can attempt playback.
     } else if (!this.changingSrc_ && (this.src() || this.currentSrc())) {
       callback(this.techGet_('play'));
       return;
 
-    // If the tech is ready, but we do not have a source, we'll need to wait
-    // for both the `ready` and a `loadstart` when the source is finally
-    // resolved by middleware and set on the player.
-    //
-    // This can happen if `play()` is called while changing sources or before
-    // one has been set on the player.
+      // If the tech is ready, but we do not have a source, we'll need to wait
+      // for both the `ready` and a `loadstart` when the source is finally
+      // resolved by middleware and set on the player.
+      //
+      // This can happen if `play()` is called while changing sources or before
+      // one has been set on the player.
     } else {
 
       this.playOnLoadstart_ = () => {
@@ -2412,27 +2453,17 @@ class Player extends Component {
       // the browser supports going fullscreen at the element level so we can
       // take the controls fullscreen as well as the video
 
+      if (!prefixedFS) {
+        this.off(FullscreenApi.fullscreenchange, this.handleFullscreenChange_);
+      }
+
       // Trigger fullscreenchange event after change
       // We have to specifically add this each time, and remove
       // when canceling fullscreen. Otherwise if there's multiple
       // players on a page, they would all be reacting to the same fullscreen
       // events
-      Events.on(document, fsApi.fullscreenchange, Fn.bind(this, function documentFullscreenChange(e) {
-        this.isFullscreen(document[fsApi.fullscreenElement]);
-
-        // If cancelling fullscreen, remove event listener.
-        if (this.isFullscreen() === false) {
-          Events.off(document, fsApi.fullscreenchange, documentFullscreenChange);
-        }
-        /**
-         * @event Player#fullscreenchange
-         * @type {EventTarget~Event}
-         */
-        this.trigger('fullscreenchange');
-      }));
-
+      Events.on(document, fsApi.fullscreenchange, Fn.bind(this, this.documentFullscreenChange_));
       this.el_[fsApi.requestFullscreen]();
-
     } else if (this.tech_.supportsFullScreen()) {
       // we can't take the video.js controls fullscreen but we can go fullscreen
       // with native controls
@@ -2461,6 +2492,8 @@ class Player extends Component {
 
     // Check for browser element fullscreen support
     if (fsApi.requestFullscreen) {
+      // remove the document level handler if we're getting called directly.
+      Events.off(document, fsApi.fullscreenchange, Fn.bind(this, this.documentFullscreenChange_));
       document[fsApi.exitFullscreen]();
     } else if (this.tech_.supportsFullScreen()) {
       this.techCall_('exitFullScreen');
@@ -2900,12 +2933,12 @@ class Player extends Component {
       this.manualAutoplay_(value);
       techAutoplay = false;
 
-    // any falsy value sets autoplay to false in the browser,
-    // lets do the same
+      // any falsy value sets autoplay to false in the browser,
+      // lets do the same
     } else if (!value) {
       this.options_.autoplay = false;
 
-    // any other value (ie truthy) sets autoplay to true
+      // any other value (ie truthy) sets autoplay to true
     } else {
       this.options_.autoplay = true;
     }
@@ -3688,11 +3721,11 @@ class Player extends Component {
     // Note: We don't actually use flexBasis (or flexOrder), but it's one of the more
     // common flex features that we can rely on when checking for flex support.
     return !('flexBasis' in elem.style ||
-            'webkitFlexBasis' in elem.style ||
-            'mozFlexBasis' in elem.style ||
-            'msFlexBasis' in elem.style ||
-            // IE10-specific (2012 flex spec)
-            'msFlexOrder' in elem.style);
+      'webkitFlexBasis' in elem.style ||
+      'mozFlexBasis' in elem.style ||
+      'msFlexBasis' in elem.style ||
+      // IE10-specific (2012 flex spec)
+      'msFlexOrder' in elem.style);
   }
 }
 
